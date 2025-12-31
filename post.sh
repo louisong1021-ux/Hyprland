@@ -1,209 +1,231 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# =========================================================
-# Part 2: Install Hyprland + Essentials (Interactive EN)
-# - Run this INSIDE the newly installed Arch system (from disk)
-# - Refuses to run in archiso/live environment
-# - Installs Hyprland + SDDM (graphical login)
-# - Installs fonts, PipeWire audio, networking tray, basic tools
-# - Installs Chinese input method (fcitx5 + rime) and sets env vars
-# - Optional: Chrome (AUR via yay) and WeChat (Flatpak)
-#
-# Run as: normal user (with sudo)
-# =========================================================
+# ===================== CONFIG =====================
+HOSTNAME="arch-hypr-vm"
+USERNAME="rui"
+USERPW="123456"
+ROOTPW="root"
 
-die(){ echo -e "\033[31mERROR: $*\033[0m" >&2;; exit 1; }
+TZ="America/Los_Angeles"
+LOCALE="en_US.UTF-8"
+KEYMAP="us"
+
+ESP_SIZE="512MiB"
+SWAP_SIZE="0GiB"   # set to "2GiB" if you want swap
+# ==================================================
+
+die(){ echo -e "\033[31mERROR: $*\033[0m" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 
-# ---- Safety: refuse to run in Arch ISO / archiso ----
-if grep -qiE 'archiso|archisobasedir|cow_spacesize' /proc/cmdline 2>/dev/null; then
-  die "This script must be run in the installed system (booted from disk), not in archiso/ISO."
+for c in lsblk sgdisk partprobe mkfs.fat mkfs.ext4 mkswap swapon mount umount \
+         pacstrap genfstab arch-chroot timedatectl awk sed find head; do
+  need "$c"
+done
+
+[[ $EUID -eq 0 ]] || die "Run as root in Arch ISO (archiso)."
+[[ -d /sys/firmware/efi ]] || die "UEFI boot is required (/sys/firmware/efi not found)."
+
+part() {
+  local disk="$1" n="$2"
+  if [[ "$disk" =~ [0-9]$ ]]; then echo "${disk}p${n}"; else echo "${disk}${n}"; fi
+}
+
+umount -R /mnt 2>/dev/null || true
+swapoff -a 2>/dev/null || true
+
+echo
+echo "=== VMware Arch + Hyprland Installer (UEFI + GRUB, auto-start Hyprland) ==="
+echo "WARNING: This will ERASE the selected disk."
+echo
+
+# ---------------- Disk selection ----------------
+echo "===== Available disks (WILL BE ERASED) ====="
+mapfile -t DISKS < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print $1}')
+((${#DISKS[@]} > 0)) || die "No disks detected."
+
+for i in "${!DISKS[@]}"; do
+  name="${DISKS[$i]}"
+  size="$(lsblk -dn -o SIZE "/dev/$name" | head -n1)"
+  model="$(lsblk -dn -o MODEL "/dev/$name" | head -n1)"
+  echo "  [$i] /dev/${name}   size=${size}   model=${model:-unknown}"
+done
+
+echo
+read -r -p "Enter disk number to install to (e.g. 0): " DISK_IDX < /dev/tty
+[[ "$DISK_IDX" =~ ^[0-9]+$ ]] || die "Please enter a numeric disk index."
+(( DISK_IDX >= 0 && DISK_IDX < ${#DISKS[@]} )) || die "Disk index out of range."
+
+DISK="/dev/${DISKS[$DISK_IDX]}"
+[[ -b "$DISK" ]] || die "Disk not found: $DISK"
+
+echo
+echo "You selected: $DISK"
+lsblk "$DISK"
+echo
+read -r -p "Type YES to confirm erasing and installing to ${DISK}: " ok < /dev/tty
+[[ "$ok" == "YES" ]] || die "Cancelled."
+
+# ---------------- Time sync ----------------
+timedatectl set-ntp true || true
+
+# ---------------- Partitioning ----------------
+echo
+echo "===== Partitioning (GPT + EFI) ====="
+sgdisk --zap-all "${DISK}"
+sgdisk -o "${DISK}"
+sgdisk -n 1:0:+"${ESP_SIZE}" -t 1:ef00 -c 1:"EFI" "${DISK}"
+
+if [[ "${SWAP_SIZE}" != "0" && "${SWAP_SIZE}" != "0GiB" ]]; then
+  sgdisk -n 2:0:+"${SWAP_SIZE}" -t 2:8200 -c 2:"SWAP" "${DISK}"
+  sgdisk -n 3:0:0 -t 3:8300 -c 3:"ROOT" "${DISK}"
+  ESP="$(part "$DISK" 1)"; SWP="$(part "$DISK" 2)"; ROOT="$(part "$DISK" 3)"
+else
+  sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "${DISK}"
+  ESP="$(part "$DISK" 1)"; SWP=""; ROOT="$(part "$DISK" 2)"
 fi
 
-[[ $EUID -ne 0 ]] || die "Please run as a normal user (not root). Use sudo when prompted."
-need sudo
-need pacman
-need systemctl
-need grep
+partprobe "$DISK" || true
+sleep 1
 
+echo "EFI : $ESP"
+echo "SWAP: ${SWP:-<none>}"
+echo "ROOT: $ROOT"
+
+# ---------------- Formatting ----------------
 echo
-echo "=== Part 2: Hyprland setup (installed system) ==="
+echo "===== Formatting ====="
+mkfs.fat -F32 "${ESP}"
+mkfs.ext4 -F "${ROOT}"
+if [[ -n "${SWP}" ]]; then
+  mkswap "${SWP}"
+  swapon "${SWP}"
+fi
+
+# ---------------- Mounting ----------------
 echo
+echo "===== Mounting ====="
+mount "${ROOT}" /mnt
+mkdir -p /mnt/boot/efi
+mount "${ESP}" /mnt/boot/efi
 
-# 1) Choose profile
-echo "Select setup profile:"
-echo "  1) Minimal Hyprland (recommended)"
-echo "  2) Full (adds Chrome + WeChat + extras)"
-echo
-read -r -p "Enter 1 or 2: " PROFILE < /dev/tty
-case "$PROFILE" in
-  1) PROFILE_NAME="minimal" ;;
-  2) PROFILE_NAME="full" ;;
-  *) die "Invalid choice. Enter 1 or 2." ;;
-esac
-echo "Selected profile: $PROFILE_NAME"
-echo
-
-# 2) Update system
-echo "Updating package databases and system..."
-sudo pacman -Syu --noconfirm
-
-# 3) Base desktop stack (Hyprland + DM + core Wayland tools)
-BASE_PKGS=(
-  hyprland
-  sddm
-  xorg-xwayland
-
-  waybar wofi kitty
-
+# ---------------- Packages (minimal for Hyprland to actually run) ----------------
+# "Only Arch + Hyprland" in practice means:
+# - base system + kernel + firmware
+# - GRUB (UEFI) + efibootmgr
+# - NetworkManager (so you can network after boot)
+# - Hyprland + Xwayland
+# - portals (many desktop apps need them)
+# - a tiny terminal (to confirm you are in Hyprland)
+# - vm tools optional but recommended for VMware usability
+PKGS=(
+  base linux linux-firmware
+  grub efibootmgr
+  networkmanager sudo
+  hyprland xorg-xwayland
   xdg-desktop-portal xdg-desktop-portal-hyprland xdg-desktop-portal-gtk
   qt5-wayland qt6-wayland
-
-  grim slurp wl-clipboard
-  cliphist
-
-  thunar thunar-archive-plugin file-roller
-  gvfs
-
-  polkit polkit-gnome
-
-  network-manager-applet
-
-  pipewire pipewire-alsa pipewire-pulse wireplumber
-  pavucontrol pamixer
-
-  noto-fonts noto-fonts-cjk noto-fonts-emoji ttf-dejavu
-
-  unzip p7zip unrar
-  wget curl
-  htop btop
-  ripgrep fd
+  foot
+  noto-fonts noto-fonts-emoji
+  open-vm-tools
 )
 
-echo "Installing Hyprland and core packages..."
-sudo pacman -S --needed --noconfirm "${BASE_PKGS[@]}"
+echo
+echo "===== Installing system (pacstrap) ====="
+pacstrap -K /mnt "${PKGS[@]}"
+genfstab -U /mnt >> /mnt/etc/fstab
 
-# 4) Ensure SDDM can see Hyprland session
-echo "Creating Hyprland session entry for display manager..."
-sudo mkdir -p /usr/share/wayland-sessions
-sudo tee /usr/share/wayland-sessions/hyprland.desktop >/dev/null <<'EOF'
-[Desktop Entry]
-Name=Hyprland
-Comment=Hyprland Wayland Compositor
-Exec=Hyprland
-Type=Application
+# ---------------- Chroot configuration ----------------
+echo
+echo "===== Configuring system (chroot) ====="
+arch-chroot /mnt /bin/bash -euo pipefail <<CHROOT
+set -euo pipefail
+
+ln -sf /usr/share/zoneinfo/${TZ} /etc/localtime
+hwclock --systohc
+
+# Locale
+sed -i "s/^#\\(${LOCALE} UTF-8\\)/\\1/" /etc/locale.gen || true
+sed -i "s/^#\\(en_US.UTF-8 UTF-8\\)/\\1/" /etc/locale.gen || true
+locale-gen
+echo "LANG=${LOCALE}" > /etc/locale.conf
+
+# Console keymap
+cat > /etc/vconsole.conf <<EOF
+KEYMAP=${KEYMAP}
 EOF
 
-# 5) Chinese input method (fcitx5 + rime)
-echo "Installing Chinese input method (fcitx5 + rime)..."
-sudo pacman -S --needed --noconfirm \
-  fcitx5 fcitx5-configtool \
-  fcitx5-im fcitx5-chinese-addons fcitx5-rime
-
-echo "Setting system-wide input method environment variables..."
-sudo tee /etc/environment >/dev/null <<'EOF'
-GTK_IM_MODULE=fcitx
-QT_IM_MODULE=fcitx
-XMODIFIERS=@im=fcitx
-SDL_IM_MODULE=fcitx
+# Hostname / hosts
+echo "${HOSTNAME}" > /etc/hostname
+cat > /etc/hosts <<EOF
+127.0.0.1 localhost
+::1       localhost
+127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
 EOF
 
-# 6) Minimal Hyprland config (safe defaults)
-echo "Writing minimal Hyprland config..."
-mkdir -p "$HOME/.config/hypr" "$HOME/.config/autostart"
+# Users
+echo "root:${ROOTPW}" | chpasswd
+id -u "${USERNAME}" >/dev/null 2>&1 || useradd -m -G wheel -s /bin/bash "${USERNAME}"
+echo "${USERNAME}:${USERPW}" | chpasswd
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
-# Autostart fcitx5 if desktop entry exists
-if [[ -f /usr/share/applications/org.fcitx.Fcitx5.desktop ]]; then
-  cp -f /usr/share/applications/org.fcitx.Fcitx5.desktop "$HOME/.config/autostart/" || true
-fi
+# Services
+systemctl enable NetworkManager
+systemctl enable vmtoolsd || true
 
-if [[ ! -f "$HOME/.config/hypr/hyprland.conf" ]]; then
-  cat > "$HOME/.config/hypr/hyprland.conf" <<'EOF'
+# ----- Auto-login on tty1 + auto start Hyprland -----
+mkdir -p /etc/systemd/system/getty@tty1.service.d
+cat > /etc/systemd/system/getty@tty1.service.d/override.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=-/usr/bin/agetty --autologin ${USERNAME} --noclear %I \$TERM
+EOF
+
+# A minimal Hyprland config (per-user)
+install -d -m 0755 /home/${USERNAME}/.config/hypr
+cat > /home/${USERNAME}/.config/hypr/hyprland.conf <<'EOF'
 $mod = SUPER
+bind = $mod, RETURN, exec, foot
+bind = $mod, Q, killactive
+bind = $mod, M, exit
 
-exec-once = waybar
-exec-once = fcitx5 -d
-exec-once = nm-applet --indicator
-exec-once = wl-paste --type text --watch cliphist store
-exec-once = wl-paste --type image --watch cliphist store
-
-bind = $mod, RETURN, exec, kitty
-bind = $mod, D, exec, wofi --show drun
-
-bind = $mod, Q, killactive,
-bind = $mod, F, fullscreen,
-bind = $mod, SPACE, togglefloating,
-
-bind = $mod, H, movefocus, l
-bind = $mod, L, movefocus, r
-bind = $mod, K, movefocus, u
-bind = $mod, J, movefocus, d
-
-bind = $mod SHIFT, S, exec, grim -g "$(slurp)" - | wl-copy
-bind = $mod, V, exec, cliphist list | wofi --dmenu | cliphist decode | wl-copy
-
-input {
-  kb_layout = us
-}
-
-misc {
-  disable_hyprland_logo = true
-}
+misc { disable_hyprland_logo = true }
 EOF
+chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.config
+
+# Start Hyprland automatically when logging into tty1
+cat > /home/${USERNAME}/.bash_profile <<'EOF'
+# Auto-start Hyprland on tty1
+if [[ -z "${WAYLAND_DISPLAY:-}" && "$(tty)" == "/dev/tty1" ]]; then
+  exec Hyprland
+fi
+EOF
+chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.bash_profile
+
+# Bootloader: GRUB UEFI
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ARCH
+grub-mkconfig -o /boot/grub/grub.cfg
+
+# VMware/UEFI fallback (fixes "No compatible bootloader found" sometimes)
+mkdir -p /boot/efi/EFI/BOOT
+if [[ -f /boot/efi/EFI/ARCH/grubx64.efi ]]; then
+  cp -f /boot/efi/EFI/ARCH/grubx64.efi /boot/efi/EFI/BOOT/BOOTX64.EFI
 else
-  echo "Hyprland config already exists, not overwriting: $HOME/.config/hypr/hyprland.conf"
+  GRUB_EFI="\$(find /boot/efi -maxdepth 5 -type f -iname 'grubx64.efi' | head -n 1 || true)"
+  [[ -n "\$GRUB_EFI" ]] && cp -f "\$GRUB_EFI" /boot/efi/EFI/BOOT/BOOTX64.EFI
 fi
-
-# 7) Optional: Full profile extras
-if [[ "$PROFILE_NAME" == "full" ]]; then
-  echo
-  echo "Full profile selected: installing extras..."
-  echo
-
-  # Flatpak + WeChat
-  echo "Installing Flatpak and WeChat (Flatpak)..."
-  sudo pacman -S --needed --noconfirm flatpak
-  sudo flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo
-  sudo flatpak install -y --system flathub com.tencent.WeChat
-
-  # AUR helper (yay) + Chrome
-  echo "Installing yay (AUR helper) if missing..."
-  if ! command -v yay >/dev/null 2>&1; then
-    sudo pacman -S --needed --noconfirm base-devel git
-    tmpdir="$(mktemp -d)"
-    git clone https://aur.archlinux.org/yay.git "$tmpdir/yay"
-    (cd "$tmpdir/yay" && makepkg -si --noconfirm)
-    rm -rf "$tmpdir"
-  fi
-
-  echo "Installing Google Chrome (AUR)..."
-  yay -S --needed --noconfirm google-chrome
-
-  # Extras commonly useful for Hyprland
-  echo "Installing extra Hyprland tools..."
-  sudo pacman -S --needed --noconfirm \
-    hyprpaper hyprlock hypridle \
-    wlogout \
-    brightnessctl playerctl
-fi
-
-# 8) Enable graphical boot + SDDM
-echo
-echo "Enabling graphical target and SDDM..."
-sudo systemctl set-default graphical.target
-sudo systemctl enable --now sddm
+CHROOT
 
 echo
-echo "✅ Part 2 complete."
-echo "Notes:"
-echo "  - On the login screen, select session: Hyprland"
-echo "  - First-time Chinese input: open Fcitx5 config and enable Rime."
-echo "  - If you were previously in TTY, reboot to verify graphical login."
+echo "✅ Install complete."
+echo "IMPORTANT (VMware): Disconnect the ISO before the next boot."
+echo "After reboot, it will auto-login and start Hyprland on tty1."
 echo
-read -r -p "Reboot now? (y/N): " RB < /dev/tty
-if [[ "${RB,,}" == "y" ]]; then
-  sudo reboot
-else
-  echo "Done. You can reboot later with: sudo reboot"
-fi
+echo "Hyprland keybinds:"
+echo "  Super+Enter  -> terminal (foot)"
+echo "  Super+Q      -> close window"
+echo "  Super+M      -> exit Hyprland"
+echo
+
+umount -R /mnt
+reboot
