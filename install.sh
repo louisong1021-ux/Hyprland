@@ -5,8 +5,9 @@ set -euo pipefail
 # ArchISO 全自动安装脚本（固定安装到 /dev/sda，无需输入 YES）
 # - 自动分区/格式化/安装 Arch
 # - 安装 Hyprland + 中文输入法(fcitx5+rime) + Chrome + 微信(Flatpak)
-# - 补齐你需要的 Hyprland 生态与常用软件（见下方“补齐清单”）
+# - 补齐 Hyprland 生态与常用软件
 # - GRUB 自动适配 UEFI / Legacy BIOS
+# - 修复：确保 SDDM 一定显示 Hyprland 会话选项
 #
 # ⚠️ 警告：此脚本会无条件清空 /dev/sda（整盘重装）
 # 仅建议用于虚拟机测试环境
@@ -81,7 +82,6 @@ cleanup
 
 log "3) 清空分区表并创建 GPT 分区（ESP + ROOT + 可选 SWAP）"
 sgdisk --zap-all "$DISK"
-
 sgdisk -n 1:0:+${ESP_SIZE} -t 1:ef00 -c 1:"EFI" "$DISK"
 
 if [[ "$SWAP_SIZE" != "0GiB" ]]; then
@@ -114,13 +114,11 @@ mount "$ROOT_PART" /mnt
 mkdir -p /mnt/boot
 mount "$ESP_PART" /mnt/boot
 
-log "6) pacstrap 安装基础系统 + 你需要的软件（补齐清单）"
-# ===== 补齐清单（你提到/我建议你需要的）=====
-# Hyprland生态：xdg-desktop-portal-gtk、cliphist、hyprpaper、hyprlock、hypridle、wlogout、pamixer
+log "6) pacstrap 安装基础系统 + 常用工具 + Hyprland 日用依赖"
+# Hyprland 生态：portal-gtk、cliphist、hyprpaper、hyprlock、hypridle、wlogout、pamixer
 # 日常：firefox、p7zip、unrar、gvfs、ntfs-3g、exfatprogs
 # 工具：openssh、btop/htop、ncdu、ripgrep、fd、tmux、python、jq
-# ==================================================
-
+# 关键：xorg-xwayland（很多应用需要 XWayland）
 pacstrap -K /mnt \
   base linux linux-firmware \
   grub efibootmgr \
@@ -138,20 +136,19 @@ pacstrap -K /mnt \
   htop btop ncdu ripgrep fd tmux python jq \
   p7zip unrar \
   gvfs ntfs-3g exfatprogs \
-  firefox
+  firefox \
+  xorg-xwayland
 
 genfstab -U /mnt >> /mnt/etc/fstab
 
-log "7) chroot 配置系统 + 安装 Hyprland/输入法/Chrome/微信 + 补齐组件"
+log "7) chroot 配置系统 + 安装桌面/输入法/Chrome/微信"
 arch-chroot /mnt /bin/bash -euo pipefail <<CHROOT
 log(){ printf "\n\033[1;32m==> %s\033[0m\n" "\$*"; }
-warn(){ printf "\n\033[1;33m[!] %s\033[0m\n" "\$*"; }
 die(){ printf "\n\033[1;31m[ERR] %s\033[0m\n" "\$*"; exit 1; }
 
 log "7.1) 时区 / 语言 / 主机名"
 ln -sf /usr/share/zoneinfo/${TZ} /etc/localtime || true
 hwclock --systohc || true
-
 sed -i 's/^#\\(${LOCALE} UTF-8\\)/\\1/' /etc/locale.gen || true
 sed -i 's/^#\\(en_US.UTF-8 UTF-8\\)/\\1/' /etc/locale.gen || true
 locale-gen
@@ -192,6 +189,16 @@ pacman -S --needed --noconfirm \
   wlogout \
   sddm
 
+# ——关键修复：确保 SDDM 能看到 Hyprland 会话——
+mkdir -p /usr/share/wayland-sessions
+cat > /usr/share/wayland-sessions/hyprland.desktop <<'EOF'
+[Desktop Entry]
+Name=Hyprland
+Comment=Hyprland Wayland Compositor
+Exec=Hyprland
+Type=Application
+EOF
+
 systemctl enable sddm
 
 log "7.5) 中文输入法：fcitx5 + rime"
@@ -222,23 +229,21 @@ fi
 yay -S --noconfirm --needed google-chrome
 USERPART
 
-log "7.8) 写入 Hyprland 最小配置（补齐：壁纸/锁屏/剪贴板历史/退出菜单）"
+log "7.8) 写入 Hyprland 最小配置（含壁纸/锁屏/剪贴板/退出菜单）"
 sudo -u ${USERNAME} bash -euo pipefail <<'USERCONF'
 set -euo pipefail
-
-mkdir -p ~/.config/hypr ~/.config/autostart ~/.config/waybar
+mkdir -p ~/.config/hypr ~/.config/autostart
 
 # 自启动 fcitx5（更稳）
 if [[ -f /usr/share/applications/org.fcitx.Fcitx5.desktop ]]; then
   cp -f /usr/share/applications/org.fcitx.Fcitx5.desktop ~/.config/autostart/ || true
 fi
 
-# Hyprland 主配置
 if [[ ! -f ~/.config/hypr/hyprland.conf ]]; then
   cat > ~/.config/hypr/hyprland.conf <<'EOF'
 $mod = SUPER
 
-# ===== Autostart =====
+# Autostart
 exec-once = waybar
 exec-once = fcitx5 -d
 exec-once = nm-applet --indicator
@@ -246,28 +251,28 @@ exec-once = hyprpaper
 exec-once = wl-paste --type text --watch cliphist store
 exec-once = wl-paste --type image --watch cliphist store
 
-# ===== Terminal / launcher =====
+# Terminal / launcher
 bind = $mod, RETURN, exec, kitty
 bind = $mod, D, exec, wofi --show drun
 
-# ===== Basic window management =====
+# Window management
 bind = $mod, Q, killactive,
 bind = $mod, F, fullscreen,
 bind = $mod, SPACE, togglefloating,
 
-# ===== Focus =====
+# Focus
 bind = $mod, H, movefocus, l
 bind = $mod, L, movefocus, r
 bind = $mod, K, movefocus, u
 bind = $mod, J, movefocus, d
 
-# ===== Screenshot =====
+# Screenshot
 bind = $mod SHIFT, S, exec, grim -g "$(slurp)" - | wl-copy
 
-# ===== Clipboard history (wofi) =====
+# Clipboard history
 bind = $mod, V, exec, cliphist list | wofi --dmenu | cliphist decode | wl-copy
 
-# ===== Lock / logout =====
+# Lock / logout
 bind = $mod, ESCAPE, exec, hyprlock
 bind = $mod SHIFT, E, exec, wlogout
 
@@ -281,27 +286,21 @@ misc {
 EOF
 fi
 
-# hyprpaper 配置（简单壁纸：纯色占位 + 你可自行替换）
-mkdir -p ~/.config/hypr
 if [[ ! -f ~/.config/hypr/hyprpaper.conf ]]; then
   cat > ~/.config/hypr/hyprpaper.conf <<'EOF'
-# 你可以把壁纸放到 ~/Pictures/wallpaper.jpg 并替换下面路径
 preload = /usr/share/backgrounds/gnome/adwaita-l.webp
 wallpaper = ,/usr/share/backgrounds/gnome/adwaita-l.webp
 splash = false
 EOF
 fi
 
-# 创建用户目录
 xdg-user-dirs-update || true
 USERCONF
 
-log "7.9) 安装 GRUB（自动兼容 UEFI / Legacy BIOS）"
+log "7.9) 安装 GRUB（UEFI / BIOS 自适配）"
 if [[ -d /sys/firmware/efi ]]; then
-  log "检测到 UEFI：安装 GRUB x86_64-efi 到 ESP(/boot)"
   grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
 else
-  log "检测到 Legacy BIOS：安装 GRUB i386-pc 到 ${DISK}"
   grub-install --target=i386-pc ${DISK}
 fi
 grub-mkconfig -o /boot/grub/grub.cfg
@@ -311,6 +310,5 @@ CHROOT
 
 log "8) 卸载挂载并重启"
 cleanup
-
 warn "安装完成：即将重启。日志在：$LOG_FILE"
 reboot
