@@ -58,4 +58,4 @@
 在 Arch 虚拟机中，直接执行以下**单行命令**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/louisong1021-ux/Hyprland/main/install.sh
+curl -fsSL https://raw.githubusercontent.com/louisong1021-ux/Hyprland/main/install.sh | bash
