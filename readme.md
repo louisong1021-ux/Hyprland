@@ -59,3 +59,7 @@
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/louisong1021-ux/Hyprland/main/install.sh | bash
+```
+```bash
+curl -fsSL https://raw.githubusercontent.com/louisong1021-ux/Hyprland/main/post.sh | bash
+
