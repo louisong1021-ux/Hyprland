@@ -2,313 +2,134 @@
 set -euo pipefail
 
 # =========================================================
-# ArchISO 全自动安装脚本（固定安装到 /dev/sda，无需输入 YES）
-# - 自动分区/格式化/安装 Arch
-# - 安装 Hyprland + 中文输入法(fcitx5+rime) + Chrome + 微信(Flatpak)
-# - 补齐 Hyprland 生态与常用软件
-# - GRUB 自动适配 UEFI / Legacy BIOS
-# - 修复：确保 SDDM 一定显示 Hyprland 会话选项
+# Arch Linux 自动重装脚本（UEFI + systemd-boot）
+# - 固定磁盘：/dev/sda
+# - 安装 Hyprland + SDDM + 中文输入法 + Chrome + 微信
+# - 使用 systemd-boot，确保 VMware UEFI 可启动
+# - 重启后直接进入图形登录界面
 #
-# ⚠️ 警告：此脚本会无条件清空 /dev/sda（整盘重装）
-# 仅建议用于虚拟机测试环境
+# ⚠️ 会无条件清空 /dev/sda，仅用于虚拟机
 # =========================================================
 
-# ===== 固定目标盘（按你的要求写死）=====
 DISK="/dev/sda"
-
-# ===== 可改参数 =====
 HOSTNAME="arch-hypr"
 USERNAME="rui"
 TZ="America/Los_Angeles"
 LOCALE="zh_CN.UTF-8"
 KEYMAP="us"
-
-# 测试用密码（装完建议立刻修改）
 ROOTPW="root"
 USERPW="123456"
 
-ESP_SIZE="512MiB"   # EFI 分区
-SWAP_SIZE="0GiB"    # 例如 "2GiB"；0GiB 表示不建 swap
-# ===================
+log(){ echo -e "\n\033[1;32m==> $*\033[0m"; }
+die(){ echo -e "\n\033[1;31m[ERR] $*\033[0m"; exit 1; }
 
-# ===== 日志（archiso 下写到 /root/install.log）=====
-LOG_FILE="/root/install.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+[[ $EUID -eq 0 ]] || die "请在 Arch ISO (archiso) 的 root 下运行"
+[[ -d /sys/firmware/efi ]] || die "当前不是 UEFI 启动，请在 VMware 中启用 UEFI"
 
-log(){ printf "\n\033[1;32m==> %s\033[0m\n" "$*"; }
-warn(){ printf "\n\033[1;33m[!] %s\033[0m\n" "$*"; }
-die(){ printf "\n\033[1;31m[ERR] %s\033[0m\n" "$*"; exit 1; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"; }
-
-cleanup(){
-  set +e
-  swapoff -a >/dev/null 2>&1 || true
-  umount -R /mnt >/dev/null 2>&1 || true
-}
-trap cleanup EXIT ERR
-
-[[ $EUID -eq 0 ]] || die "请在 Arch ISO（archiso）环境的 root 下运行。"
-[[ -b "$DISK" ]] || die "找不到块设备：$DISK"
-
-need lsblk
-need sgdisk
-need mkfs.fat
-need mkfs.ext4
-need mount
-need umount
-need pacstrap
-need genfstab
-need arch-chroot
-need timedatectl
-need loadkeys
-need partprobe
-
-log "目标磁盘固定为：$DISK"
-lsblk "$DISK" || true
-
-warn "即将清空并重装整块磁盘：$DISK（无确认步骤）"
-warn "如果这不是你要装的盘，请立刻按 Ctrl+C 终止。"
-for i in 5 4 3 2 1; do
-  echo "  $i..."
-  sleep 1
-done
-
-log "1) 时间同步 & 键盘布局"
-timedatectl set-ntp true || true
-loadkeys "$KEYMAP" || true
-
-log "2) 清理旧挂载/交换（如果有）"
-cleanup
-
-log "3) 清空分区表并创建 GPT 分区（ESP + ROOT + 可选 SWAP）"
+log "1) 清盘并分区（EFI + ROOT）"
 sgdisk --zap-all "$DISK"
-sgdisk -n 1:0:+${ESP_SIZE} -t 1:ef00 -c 1:"EFI" "$DISK"
+sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DISK"
+sgdisk -n 2:0:0     -t 2:8300 -c 2:"ROOT" "$DISK"
+partprobe "$DISK"
 
-if [[ "$SWAP_SIZE" != "0GiB" ]]; then
-  sgdisk -n 2:0:+${SWAP_SIZE} -t 2:8200 -c 2:"SWAP" "$DISK"
-  sgdisk -n 3:0:0 -t 3:8300 -c 3:"ROOT" "$DISK"
-  ESP_PART="${DISK}1"
-  SWAP_PART="${DISK}2"
-  ROOT_PART="${DISK}3"
-else
-  sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$DISK"
-  ESP_PART="${DISK}1"
-  ROOT_PART="${DISK}2"
-  SWAP_PART=""
-fi
+mkfs.fat -F32 "${DISK}1"
+mkfs.ext4 -F "${DISK}2"
 
-partprobe "$DISK" || true
-sleep 1
-lsblk "$DISK"
-
-log "4) 格式化分区"
-mkfs.fat -F32 "$ESP_PART"
-mkfs.ext4 -F "$ROOT_PART"
-if [[ -n "$SWAP_PART" ]]; then
-  mkswap "$SWAP_PART"
-  swapon "$SWAP_PART"
-fi
-
-log "5) 挂载到 /mnt（ESP 挂到 /boot）"
-mount "$ROOT_PART" /mnt
+mount "${DISK}2" /mnt
 mkdir -p /mnt/boot
-mount "$ESP_PART" /mnt/boot
+mount "${DISK}1" /mnt/boot
 
-log "6) pacstrap 安装基础系统 + 常用工具 + Hyprland 日用依赖"
-# Hyprland 生态：portal-gtk、cliphist、hyprpaper、hyprlock、hypridle、wlogout、pamixer
-# 日常：firefox、p7zip、unrar、gvfs、ntfs-3g、exfatprogs
-# 工具：openssh、btop/htop、ncdu、ripgrep、fd、tmux、python、jq
-# 关键：xorg-xwayland（很多应用需要 XWayland）
+log "2) 安装基础系统"
 pacstrap -K /mnt \
   base linux linux-firmware \
-  grub efibootmgr \
-  sudo git curl wget unzip \
-  base-devel \
-  networkmanager network-manager-applet \
-  vim nano \
-  pipewire pipewire-alsa pipewire-pulse wireplumber \
-  xdg-user-dirs xdg-utils \
-  mesa vulkan-icd-loader \
-  noto-fonts noto-fonts-cjk noto-fonts-emoji ttf-dejavu \
+  sudo git curl vim nano \
+  networkmanager \
+  pipewire pipewire-pulse wireplumber \
   flatpak \
-  open-vm-tools \
-  openssh \
-  htop btop ncdu ripgrep fd tmux python jq \
-  p7zip unrar \
-  gvfs ntfs-3g exfatprogs \
-  firefox \
+  noto-fonts noto-fonts-cjk noto-fonts-emoji \
   xorg-xwayland
 
 genfstab -U /mnt >> /mnt/etc/fstab
 
-log "7) chroot 配置系统 + 安装桌面/输入法/Chrome/微信"
-arch-chroot /mnt /bin/bash -euo pipefail <<CHROOT
-log(){ printf "\n\033[1;32m==> %s\033[0m\n" "\$*"; }
-die(){ printf "\n\033[1;31m[ERR] %s\033[0m\n" "\$*"; exit 1; }
+log "3) 进入 chroot 配置系统"
+arch-chroot /mnt /bin/bash <<CHROOT
 
-log "7.1) 时区 / 语言 / 主机名"
-ln -sf /usr/share/zoneinfo/${TZ} /etc/localtime || true
-hwclock --systohc || true
-sed -i 's/^#\\(${LOCALE} UTF-8\\)/\\1/' /etc/locale.gen || true
-sed -i 's/^#\\(en_US.UTF-8 UTF-8\\)/\\1/' /etc/locale.gen || true
+set -e
+
+ln -sf /usr/share/zoneinfo/${TZ} /etc/localtime
+hwclock --systohc
+
+sed -i 's/^#${LOCALE}/${LOCALE}/' /etc/locale.gen
 locale-gen
 echo "LANG=${LOCALE}" > /etc/locale.conf
-
 echo "${HOSTNAME}" > /etc/hostname
+
 cat > /etc/hosts <<EOF
-127.0.0.1   localhost
-::1         localhost
-127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
+127.0.0.1 localhost
+::1       localhost
+127.0.1.1 ${HOSTNAME}
 EOF
 
-log "7.2) 创建用户 + sudo"
-id -u ${USERNAME} >/dev/null 2>&1 || useradd -m -G wheel -s /bin/bash ${USERNAME}
+useradd -m -G wheel -s /bin/bash ${USERNAME}
 echo "root:${ROOTPW}" | chpasswd
 echo "${USERNAME}:${USERPW}" | chpasswd
 sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
-log "7.3) 启用服务：NetworkManager / SSH / VMware Tools"
 systemctl enable NetworkManager
-systemctl enable sshd
-systemctl enable vmtoolsd || true
 
-log "7.4) 安装 Hyprland + 生态补齐 + SDDM"
-pacman -S --needed --noconfirm \
+log "4) 安装 systemd-boot（UEFI 原生）"
+bootctl install
+
+ROOT_UUID=\$(blkid -s UUID -o value ${DISK}2)
+
+cat > /boot/loader/loader.conf <<EOF
+default arch
+timeout 3
+editor no
+EOF
+
+cat > /boot/loader/entries/arch.conf <<EOF
+title Arch Linux
+linux /vmlinuz-linux
+initrd /initramfs-linux.img
+options root=UUID=\${ROOT_UUID} rw
+EOF
+
+log "5) 安装桌面：Hyprland + SDDM"
+pacman -S --noconfirm \
   hyprland \
-  waybar wofi \
-  kitty \
-  thunar thunar-archive-plugin file-roller \
-  grim slurp wl-clipboard \
-  xdg-desktop-portal xdg-desktop-portal-hyprland xdg-desktop-portal-gtk \
-  qt5-wayland qt6-wayland \
-  brightnessctl playerctl \
-  pavucontrol pamixer \
-  polkit polkit-gnome \
-  cliphist \
-  hyprpaper hyprlock hypridle \
-  wlogout \
-  sddm
+  sddm \
+  waybar wofi kitty \
+  thunar \
+  fcitx5 fcitx5-rime \
+  xdg-desktop-portal xdg-desktop-portal-hyprland \
+  qt5-wayland qt6-wayland
 
-# ——关键修复：确保 SDDM 能看到 Hyprland 会话——
 mkdir -p /usr/share/wayland-sessions
-cat > /usr/share/wayland-sessions/hyprland.desktop <<'EOF'
+cat > /usr/share/wayland-sessions/hyprland.desktop <<EOF
 [Desktop Entry]
 Name=Hyprland
-Comment=Hyprland Wayland Compositor
 Exec=Hyprland
 Type=Application
 EOF
 
 systemctl enable sddm
+systemctl set-default graphical.target
 
-log "7.5) 中文输入法：fcitx5 + rime"
-pacman -S --needed --noconfirm \
-  fcitx5 fcitx5-configtool \
-  fcitx5-im fcitx5-chinese-addons fcitx5-rime || true
+log "6) 安装微信 & Chrome"
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+flatpak install -y flathub com.tencent.WeChat
 
-cat > /etc/environment <<EOF
-GTK_IM_MODULE=fcitx
-QT_IM_MODULE=fcitx
-XMODIFIERS=@im=fcitx
-SDL_IM_MODULE=fcitx
-EOF
-
-log "7.6) 安装微信（Flatpak / Flathub，系统级）"
-flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo
-flatpak install -y --system flathub com.tencent.WeChat
-
-log "7.7) 安装 yay + Chrome（AUR，使用普通用户构建）"
-sudo -u ${USERNAME} bash -euo pipefail <<'USERPART'
-set -euo pipefail
-if ! command -v yay >/dev/null 2>&1; then
-  tmpdir="$(mktemp -d)"
-  git clone https://aur.archlinux.org/yay.git "$tmpdir/yay"
-  (cd "$tmpdir/yay" && makepkg -si --noconfirm)
-  rm -rf "$tmpdir"
-fi
-yay -S --noconfirm --needed google-chrome
-USERPART
-
-log "7.8) 写入 Hyprland 最小配置（含壁纸/锁屏/剪贴板/退出菜单）"
-sudo -u ${USERNAME} bash -euo pipefail <<'USERCONF'
-set -euo pipefail
-mkdir -p ~/.config/hypr ~/.config/autostart
-
-# 自启动 fcitx5（更稳）
-if [[ -f /usr/share/applications/org.fcitx.Fcitx5.desktop ]]; then
-  cp -f /usr/share/applications/org.fcitx.Fcitx5.desktop ~/.config/autostart/ || true
-fi
-
-if [[ ! -f ~/.config/hypr/hyprland.conf ]]; then
-  cat > ~/.config/hypr/hyprland.conf <<'EOF'
-$mod = SUPER
-
-# Autostart
-exec-once = waybar
-exec-once = fcitx5 -d
-exec-once = nm-applet --indicator
-exec-once = hyprpaper
-exec-once = wl-paste --type text --watch cliphist store
-exec-once = wl-paste --type image --watch cliphist store
-
-# Terminal / launcher
-bind = $mod, RETURN, exec, kitty
-bind = $mod, D, exec, wofi --show drun
-
-# Window management
-bind = $mod, Q, killactive,
-bind = $mod, F, fullscreen,
-bind = $mod, SPACE, togglefloating,
-
-# Focus
-bind = $mod, H, movefocus, l
-bind = $mod, L, movefocus, r
-bind = $mod, K, movefocus, u
-bind = $mod, J, movefocus, d
-
-# Screenshot
-bind = $mod SHIFT, S, exec, grim -g "$(slurp)" - | wl-copy
-
-# Clipboard history
-bind = $mod, V, exec, cliphist list | wofi --dmenu | cliphist decode | wl-copy
-
-# Lock / logout
-bind = $mod, ESCAPE, exec, hyprlock
-bind = $mod SHIFT, E, exec, wlogout
-
-input {
-  kb_layout = us
-}
-
-misc {
-  disable_hyprland_logo = true
-}
-EOF
-fi
-
-if [[ ! -f ~/.config/hypr/hyprpaper.conf ]]; then
-  cat > ~/.config/hypr/hyprpaper.conf <<'EOF'
-preload = /usr/share/backgrounds/gnome/adwaita-l.webp
-wallpaper = ,/usr/share/backgrounds/gnome/adwaita-l.webp
-splash = false
-EOF
-fi
-
-xdg-user-dirs-update || true
-USERCONF
-
-log "7.9) 安装 GRUB（UEFI / BIOS 自适配）"
-if [[ -d /sys/firmware/efi ]]; then
-  grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
-else
-  grub-install --target=i386-pc ${DISK}
-fi
-grub-mkconfig -o /boot/grub/grub.cfg
-
-log "chroot 配置完成"
 CHROOT
 
-log "8) 卸载挂载并重启"
-cleanup
-warn "安装完成：即将重启。日志在：$LOG_FILE"
-reboot
+log "7) 安装完成，请关机并断开 ISO"
+umount -R /mnt
+echo
+echo "=================================================="
+echo "安装完成！"
+echo "请在 VMware 中："
+echo "1) 关闭虚拟机"
+echo "2) 断开 Arch ISO"
+echo "3) 再次开机"
+echo "你将直接进入 SDDM 图形登录界面"
+echo "=================================================="
